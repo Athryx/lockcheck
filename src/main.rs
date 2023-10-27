@@ -10,6 +10,7 @@ extern crate rustc_hash;
 extern crate rustc_span;
 extern crate rustc_errors;
 extern crate rustc_error_codes;
+extern crate rustc_index;
 
 mod analysis;
 mod config;

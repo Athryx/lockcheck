@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, Context};
-use serde::{Serialize, Deserialize};
+use serde::Deserialize;
 
 /// Identifies a lock type which will be checked
 // TODO: don't require specifying lock method and constructor path
