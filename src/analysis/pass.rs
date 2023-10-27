@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustc_span::{symbol::Symbol, def_id::DefId};
 use rustc_middle::ty::{TyCtxt, TyKind, Ty};
 use rustc_middle::mir::{START_BLOCK, BasicBlock, Terminator, TerminatorKind, Operand, Const, ConstValue, Body};
+use rustc_middle::mir::traversal::reachable;
 use rustc_hir::ItemKind;
 
 use super::LOCK_FILLER_FN_NAME;
@@ -33,10 +34,28 @@ pub struct LockInvocation {
     dependant_classes: HashSet<LockClass>,
 }
 
+impl LockInvocation {
+    fn new(class: LockClass) -> Self {
+        LockInvocation {
+            class,
+            dependant_classes: HashSet::new(),
+        }
+    }
+}
+
+/// Basic Block ID
+/// 
+/// Uniquely identifies any basic block in the whole program
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Bbid {
+    def_id: DefId,
+    basic_block: BasicBlock,
+}
+
 pub struct AnalysisPass<'tcx> {
     tcx: TyCtxt<'tcx>,
     pass_target: AnalysisPassTarget,
-    invocations: HashMap<BasicBlock, LockInvocation>,
+    invocations: HashMap<Bbid, LockInvocation>,
     lock_class_ty_map: HashMap<Ty<'tcx>, LockClass>,
 }
 
@@ -75,7 +94,7 @@ impl<'tcx> AnalysisPass<'tcx> {
     }
 
     fn lock_class_from_terminator(&mut self, mir_body: &Body<'tcx>, basic_block: BasicBlock) -> Option<LockClass> {
-        let terminator = (&mir_body.basic_blocks[basic_block]).terminator.as_ref()?;
+        let terminator = mir_body.basic_blocks[basic_block].terminator();
 
         if !self.is_terminator_lock_invocation(terminator) {
             return None;
@@ -107,6 +126,19 @@ impl<'tcx> AnalysisPass<'tcx> {
         None
     }
 
+    fn collect_invocations(&mut self, def_id: DefId, mir_body: &Body<'tcx>) {
+        for (basic_block, _) in reachable(mir_body) {
+            if let Some(lock_class) = self.lock_class_from_terminator(mir_body, basic_block) {
+                let bbid = Bbid {
+                    def_id,
+                    basic_block,
+                };
+
+                self.invocations.insert(bbid, LockInvocation::new(lock_class));
+            }
+        }
+    }
+
     pub fn run_pass(&mut self) {
         let hir = self.tcx.hir();
 
@@ -125,8 +157,11 @@ impl<'tcx> AnalysisPass<'tcx> {
                 continue;
             }
 
+            let def_id = item.owner_id.to_def_id();
             let mir = self.tcx.optimized_mir(item.owner_id.to_def_id());
-            let start_block = &mir.basic_blocks[START_BLOCK];
+
+            self.collect_invocations(def_id, mir);
+            /*let start_block = &mir.basic_blocks[START_BLOCK];
             let _tmp = self.lock_class_from_terminator(mir, START_BLOCK);
             println!("{_tmp:?}");
             let TerminatorKind::Call { ref func, .. } = start_block.terminator.as_ref().unwrap().kind else {
@@ -138,7 +173,9 @@ impl<'tcx> AnalysisPass<'tcx> {
             println!("{:#?}", c.const_);
 
             return;
-            println!("{mir:#?}");
+            println!("{mir:#?}");*/
         }
+
+        println!("{:#?}", self.invocations);
     }
 }
