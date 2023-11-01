@@ -21,3 +21,8 @@ For now only scan for deadlocks which occur entirely in 1 function
     - For each invocation, track all other invocations that occur while guard is alive
         - TODO: figure out how to do this
         - The lock class of all other invocations found are added to dependant lock classes set
+
+# TODO
+
+For diverging terminators, maybe print warning if lock is held and they are reached
+Detect loops in basic blocks

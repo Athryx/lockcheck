@@ -1,14 +1,17 @@
 use std::collections::{HashSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
+use std::rc::Rc;
 
-use rustc_span::{symbol::Symbol, def_id::DefId};
+use rustc_session::Session;
+use rustc_span::{Span, symbol::Symbol, def_id::DefId};
 use rustc_middle::ty::{TyCtxt, TyKind, Ty};
 use rustc_middle::mir::{BasicBlock, Terminator, TerminatorKind, Operand, Const, ConstValue, Body, Local, Statement, StatementKind, Rvalue};
 use rustc_middle::mir::traversal::reachable;
 use rustc_hir::ItemKind;
 
 use super::LOCK_FILLER_FN_NAME;
+use crate::diagnostic::deadlock_error;
 
 #[derive(Debug)]
 pub struct AnalysisPassTarget {
@@ -32,14 +35,16 @@ impl LockClass {
 #[derive(Debug)]
 pub struct LockInvocation {
     class: LockClass,
-    dependant_classes: RefCell<HashSet<LockClass>>,
+    child_invocations: RefCell<HashSet<Bbid>>,
+    span: Span,
 }
 
 impl LockInvocation {
-    fn new(class: LockClass) -> Self {
+    fn new(class: LockClass, span: Span,) -> Self {
         LockInvocation {
             class,
-            dependant_classes: RefCell::new(HashSet::new()),
+            child_invocations: RefCell::new(HashSet::new()),
+            span,
         }
     }
 }
@@ -55,15 +60,17 @@ struct Bbid {
 
 pub struct AnalysisPass<'tcx> {
     tcx: TyCtxt<'tcx>,
+    session: Rc<Session>,
     pass_target: AnalysisPassTarget,
     invocations: HashMap<Bbid, LockInvocation>,
     lock_class_ty_map: HashMap<Ty<'tcx>, LockClass>,
 }
 
 impl<'tcx> AnalysisPass<'tcx> {
-    pub fn new(pass_target: AnalysisPassTarget, tcx: TyCtxt<'tcx>) -> Self {
+    pub fn new(pass_target: AnalysisPassTarget, tcx: TyCtxt<'tcx>, session: Rc<Session>) -> Self {
         AnalysisPass {
             tcx,
+            session,
             pass_target,
             invocations: HashMap::new(),
             lock_class_ty_map: HashMap::new(),
@@ -129,13 +136,14 @@ impl<'tcx> AnalysisPass<'tcx> {
 
     fn collect_invocations_for_body(&mut self, def_id: DefId, mir_body: &Body<'tcx>) {
         for (basic_block, _) in reachable(mir_body) {
+            let terminator = mir_body.basic_blocks[basic_block].terminator();
             if let Some(lock_class) = self.lock_class_from_terminator(mir_body, basic_block) {
                 let bbid = Bbid {
                     def_id,
                     basic_block,
                 };
 
-                self.invocations.insert(bbid, LockInvocation::new(lock_class));
+                self.invocations.insert(bbid, LockInvocation::new(lock_class, terminator.source_info.span));
             }
         }
     }
@@ -180,44 +188,91 @@ impl<'tcx> AnalysisPass<'tcx> {
                 mir_body_def_id: bbid.def_id,
                 mir_body,
                 dependant_classes: HashSet::new(),
+                visited_blocks: HashSet::new(),
             };
-            let dependant_classes = collector.collect(target, destination.local);
-            *invocation.dependant_classes.borrow_mut() = dependant_classes;
+            let child_invocations = collector.collect(target, destination.local);
+            *invocation.child_invocations.borrow_mut() = child_invocations;
         }
+    }
+
+    /// Creates a map for each lock class to which lock classes are called while the current lock class is locked
+    fn get_dependant_map(&self) -> HashMap<LockClass, HashSet<LockClass>> {
+        let mut dependant_map = HashMap::new();
+
+        for invocation in self.invocations.values() {
+            let current_invocation_dependancies: &mut HashSet<LockClass> = dependant_map
+                .entry(invocation.class)
+                .or_default();
+
+            for child_id in invocation.child_invocations.borrow().iter() {
+                let child_invocation = &self.invocations[child_id];
+                current_invocation_dependancies.insert(child_invocation.class);
+            }
+        }
+
+        dependant_map
     }
 
     pub fn run_pass(&mut self) {
         self.collect_invocations();
         self.collect_dependant_lock_classes();
-
         println!("{:#?}", self.invocations);
+
+        let dependant_map = self.get_dependant_map();
+        println!("{dependant_map:#?}");
+        for (class, dependants) in dependant_map.iter() {
+            for dependant in dependants.iter() {
+                if dependant_map[dependant].contains(class) {
+                    // deadlock detected
+                    // FIXME: print regular looking error
+                    deadlock_error(&self.session);
+                }
+            }
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LocalBlockPair {
+    block: BasicBlock,
+    local: Local,
 }
 
 struct DependantClassCollector<'a, 'tcx> {
     invocation_map: &'a HashMap<Bbid, LockInvocation>,
     mir_body_def_id: DefId,
     mir_body: &'tcx Body<'tcx>,
-    dependant_classes: HashSet<LockClass>,
+    dependant_classes: HashSet<Bbid>,
+    visited_blocks: HashSet<LocalBlockPair>,
 }
 
 impl DependantClassCollector<'_, '_> {
-    fn collect(mut self, basic_block: BasicBlock, lock_local: Local) -> HashSet<LockClass> {
-        self.collect_dependant_classes_inner(basic_block, lock_local);
+    fn collect(mut self, basic_block: BasicBlock, lock_local: Local) -> HashSet<Bbid> {
+        self.collect_inner(basic_block, lock_local);
 
         let Self { dependant_classes, .. } = self;
         dependant_classes
     }
 
-    fn collect_dependant_classes_inner(&mut self, mut basic_block: BasicBlock, mut current_local: Local) {
+    fn collect_inner(&mut self, mut basic_block: BasicBlock, mut current_local: Local) {
         loop {
+            // don't visit a block for which we already examined the flow for the given local
+            let local_block_pair = LocalBlockPair {
+                block: basic_block,
+                local: current_local,
+            };
+            if self.visited_blocks.contains(&local_block_pair) {
+                return;
+            }
+            self.visited_blocks.insert(local_block_pair);
+
             // mark dependant class if this current block also is a lock invocation
             let current_bbid = Bbid {
                 def_id: self.mir_body_def_id,
                 basic_block,
             };
             if let Some(invocation) = self.invocation_map.get(&current_bbid) {
-                self.dependant_classes.insert(invocation.class);
+                self.dependant_classes.insert(current_bbid);
             }
 
             let basic_block_data = &self.mir_body[basic_block];
@@ -230,7 +285,7 @@ impl DependantClassCollector<'_, '_> {
                 TerminatorKind::Goto { target } => basic_block = *target,
                 TerminatorKind::SwitchInt { targets, .. } => {
                     for (_, target) in targets.iter() {
-                        self.collect_dependant_classes_inner(target, current_local);
+                        self.collect_inner(target, current_local);
                     }
                     return;
                 },
@@ -245,7 +300,22 @@ impl DependantClassCollector<'_, '_> {
                         basic_block = *target;
                     }
                 },
-                TerminatorKind::Call { .. } => todo!(),
+                TerminatorKind::Call { args, destination, target, .. } => {
+                    if destination.local == current_local {
+                        panic!("lock guard overwritten while not dropped");
+                    }
+
+                    for arg in args.iter() {
+                        // FIXME: handle args
+                    }
+
+                    if let Some(target) = target {
+                        basic_block = *target;
+                    } else {
+                        // function call diverges
+                        return;
+                    }
+                },
                 TerminatorKind::Assert { target, .. } => basic_block = *target,
                 TerminatorKind::Yield { .. } => todo!(),
                 // aparently this is like a return from generator?

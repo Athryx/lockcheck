@@ -2,8 +2,10 @@ mod pass;
 
 use std::{path, process, str};
 use std::fmt::Write;
+use std::rc::Rc;
 
 use rustc_interface::Config;
+use rustc_session::Session;
 use rustc_session::config::{self, CheckCfg};
 use rustc_span::{FileName, RealFileName, symbol::Symbol, def_id::DefId};
 use rustc_errors::registry::Registry;
@@ -20,27 +22,9 @@ struct AnalysisCtx<'tcx> {
 }
 
 impl<'tcx> AnalysisCtx<'tcx> {
-    fn parse_def_id_from_ty(ty: &Ty, typecheck: &TypeckResults) -> DefId {
-        let TyKind::Path(ref ty_path) = ty.kind else {
-            invalid_hir();
-        };
+    fn parse_passes_from_hir(tcx: TyCtxt<'tcx>, session: &Rc<Session>) -> Self {
+        let mut passes = Vec::new();
 
-        typecheck.qpath_res(ty_path, ty.hir_id).def_id()
-    }
-
-    fn parse_def_id_from_call_expr(expr: &Expr, typecheck: &TypeckResults) -> DefId {
-        let ExprKind::Call(call_expr, _) = expr.kind else {
-            invalid_hir();
-        };
-
-        let ExprKind::Path(ref ty_path) = call_expr.kind else {
-            invalid_hir();
-        };
-
-        typecheck.qpath_res(ty_path, call_expr.hir_id).def_id()
-    }
-
-    fn parse_passes_from_hir(&mut self, tcx: TyCtxt<'tcx>) {
         let hir = tcx.hir();
 
         let lock_filler_symbol = Symbol::intern(LOCK_FILLER_FN_NAME);
@@ -90,11 +74,35 @@ impl<'tcx> AnalysisCtx<'tcx> {
                         lock_constructor: lock_constructor_def_id,
                         lock_method: lock_method_def_id,
                         guard: guard_def_id,
-                    }, tcx);
-                    self.passes.push(pass);
+                    }, tcx, session.clone());
+                    passes.push(pass);
                 }
             }
         }
+
+        AnalysisCtx {
+            passes,
+        }
+    }
+
+    fn parse_def_id_from_ty(ty: &Ty, typecheck: &TypeckResults) -> DefId {
+        let TyKind::Path(ref ty_path) = ty.kind else {
+            invalid_hir();
+        };
+
+        typecheck.qpath_res(ty_path, ty.hir_id).def_id()
+    }
+
+    fn parse_def_id_from_call_expr(expr: &Expr, typecheck: &TypeckResults) -> DefId {
+        let ExprKind::Call(call_expr, _) = expr.kind else {
+            invalid_hir();
+        };
+
+        let ExprKind::Path(ref ty_path) = call_expr.kind else {
+            invalid_hir();
+        };
+
+        typecheck.qpath_res(ty_path, call_expr.hir_id).def_id()
     }
 
     fn run_passes(&mut self) {
@@ -185,9 +193,8 @@ pub fn run(config: &LockCheckConfig) -> Result<()> {
             let _crate_ast = queries.parse().unwrap().get_mut().clone();
 
             queries.global_ctxt().unwrap().enter(|tcx| {
-                let mut analysis_ctx = AnalysisCtx::default();
+                let mut analysis_ctx = AnalysisCtx::parse_passes_from_hir(tcx, compiler.session());
 
-                analysis_ctx.parse_passes_from_hir(tcx);
                 analysis_ctx.run_passes();
             });
         });

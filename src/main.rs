@@ -14,6 +14,7 @@ extern crate rustc_index;
 
 mod analysis;
 mod config;
+mod diagnostic;
 
 use std::process::Command;
 
