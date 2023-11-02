@@ -31,4 +31,5 @@ Detect loops in basic blocks
 
 - Fix error messages having long path including whole absolute path
     - ideally it would just be a short path relative to the crate root
-- Includ a note section in the error message with the correct order to lock locks
+- Include a note section in the error message with the correct order to lock locks
+- Print error messages in order they occur in file, not some random order based on what hashmap iter decides

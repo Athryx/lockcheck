@@ -313,9 +313,12 @@ impl DependantClassCollector<'_, '_> {
                 TerminatorKind::Goto { target } => basic_block = *target,
                 TerminatorKind::SwitchInt { targets, .. } => {
                     for (_, target) in targets.iter() {
+                        // this runs for each branch except the otherwise
                         self.collect_inner(target, current_local);
                     }
-                    return;
+
+                    // now we run for the otherwise branch
+                    basic_block = targets.otherwise();
                 },
                 TerminatorKind::UnwindResume => return,
                 TerminatorKind::UnwindTerminate(_) => return,
