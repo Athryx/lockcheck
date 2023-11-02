@@ -26,3 +26,9 @@ For now only scan for deadlocks which occur entirely in 1 function
 
 For diverging terminators, maybe print warning if lock is held and they are reached
 Detect loops in basic blocks
+
+## Messages
+
+- Fix error messages having long path including whole absolute path
+    - ideally it would just be a short path relative to the crate root
+- Includ a note section in the error message with the correct order to lock locks

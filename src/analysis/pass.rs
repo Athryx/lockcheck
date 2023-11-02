@@ -32,6 +32,29 @@ impl LockClass {
     }
 }
 
+#[derive(Default)]
+struct LockClassTyMap<'tcx> {
+    class_to_ty: HashMap<LockClass, Ty<'tcx>>,
+    ty_to_class: HashMap<Ty<'tcx>, LockClass>,
+}
+
+impl<'tcx> LockClassTyMap<'tcx> {
+    fn get_lock_class(&mut self, ty: Ty<'tcx>) -> LockClass {
+        if let Some(class) = self.ty_to_class.get(&ty) {
+            *class
+        } else {
+            let class = LockClass::new();
+            self.class_to_ty.insert(class, ty);
+            self.ty_to_class.insert(ty, class);
+            class
+        }
+    }
+
+    fn get_ty(&self, class: LockClass) -> Ty<'tcx> {
+        self.class_to_ty[&class]
+    }
+}
+
 #[derive(Debug)]
 pub struct LockInvocation {
     class: LockClass,
@@ -63,7 +86,7 @@ pub struct AnalysisPass<'tcx> {
     session: Rc<Session>,
     pass_target: AnalysisPassTarget,
     invocations: HashMap<Bbid, LockInvocation>,
-    lock_class_ty_map: HashMap<Ty<'tcx>, LockClass>,
+    lock_class_ty_map: LockClassTyMap<'tcx>,
 }
 
 impl<'tcx> AnalysisPass<'tcx> {
@@ -73,12 +96,8 @@ impl<'tcx> AnalysisPass<'tcx> {
             session,
             pass_target,
             invocations: HashMap::new(),
-            lock_class_ty_map: HashMap::new(),
+            lock_class_ty_map: LockClassTyMap::default(),
         }
-    }
-
-    fn get_lock_cass_for_type(&mut self, ty: Ty<'tcx>) -> LockClass {
-        *self.lock_class_ty_map.entry(ty).or_insert_with(|| LockClass::new())
     }
 
     fn is_terminator_lock_invocation(&self, terminator: &Terminator) -> bool {
@@ -127,7 +146,7 @@ impl<'tcx> AnalysisPass<'tcx> {
 
                 // FIXME: don't panic here
                 let generic_type = generic_args[0].expect_ty();
-                return Some(self.get_lock_cass_for_type(generic_type));
+                return Some(self.lock_class_ty_map.get_lock_class(generic_type));
             }
         }
 
@@ -220,15 +239,24 @@ impl<'tcx> AnalysisPass<'tcx> {
 
         let dependant_map = self.get_dependant_map();
         println!("{dependant_map:#?}");
-        for (class, dependants) in dependant_map.iter() {
-            for dependant in dependants.iter() {
-                if dependant_map[dependant].contains(class) {
-                    // deadlock detected
-                    // FIXME: print regular looking error
-                    deadlock_error(&self.session);
+
+        for invocation in self.invocations.values() {
+            for child_id in invocation.child_invocations.borrow().iter() {
+                let child_invocation = &self.invocations[child_id];
+                let child_dependancies = &dependant_map[&child_invocation.class];
+
+                // if somewhere else our lock class is locked after the child, it is a deadlock potential error
+                if child_dependancies.contains(&invocation.class) {
+                    self.emit_deadlock_error(invocation, child_invocation);
                 }
             }
         }
+    }
+
+    fn emit_deadlock_error(&self, parent_invocation: &LockInvocation, child_invocation: &LockInvocation) {
+        let parent_ty = self.lock_class_ty_map.get_ty(parent_invocation.class);
+        let child_ty = self.lock_class_ty_map.get_ty(child_invocation.class);
+        deadlock_error(&self.session, parent_ty, parent_invocation.span, child_ty, child_invocation.span);
     }
 }
 
@@ -271,7 +299,7 @@ impl DependantClassCollector<'_, '_> {
                 def_id: self.mir_body_def_id,
                 basic_block,
             };
-            if let Some(invocation) = self.invocation_map.get(&current_bbid) {
+            if self.invocation_map.contains_key(&current_bbid) {
                 self.dependant_classes.insert(current_bbid);
             }
 
@@ -306,7 +334,18 @@ impl DependantClassCollector<'_, '_> {
                     }
 
                     for arg in args.iter() {
-                        // FIXME: handle args
+                        // FIXME: we should examine function that is called to see if it potantially
+                        // stores mutext guard somewhere or returns the mutex guard again
+                        // currently we assume the function just drops it
+                        
+                        match arg {
+                            // lock guard is moved into the function and assumed for now to be dropped in that function, finish analysis
+                            Operand::Move(place) if place.local == current_local => return,
+                            // FIXME: I don't know if this is actually true, I think after drop elaboration
+                            // the compiler may turn moves into copies
+                            Operand::Copy(place) if place.local == current_local => panic!("lock guard cannot be copied"),
+                            _ => continue,
+                        }
                     }
 
                     if let Some(target) = target {
