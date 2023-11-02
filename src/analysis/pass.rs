@@ -389,7 +389,20 @@ fn calculate_new_local_after_statement(statement: &Statement, current_local: Loc
                 Rvalue::Use(operand) => operand,
                 // FIXME: handle this case correctly
                 // aggregute is used when constructing a struct or enum, so the mutex guard could be put in a struct
-                Rvalue::Aggregate(_, _) => return current_local,
+                Rvalue::Aggregate(_, arguments) => {
+                    for arg in arguments.iter() {
+                        match arg {
+                            // FIXME: I don't know if this is actually true, I think after drop elaboration
+                            // the compiler may turn moves into copies
+                            Operand::Copy(place) if place.local == current_local => panic!("lock guard cannot be copied"),
+                            Operand::Move(place) if place.local == current_local => return assign_data.0.local,
+                            _ => continue,
+                        }
+                    }
+
+                    // none of the args to adt are the current local, so current local has not changed places
+                    return current_local;
+                },
                 // the rest of rvalues for the most part won't be used on something like a lock guard
                 _ => return current_local,
             };
@@ -398,7 +411,7 @@ fn calculate_new_local_after_statement(statement: &Statement, current_local: Loc
                 // FIXME: I don't know if this is actually true, I think after drop elaboration
                 // the compiler may turn moves into copies
                 Operand::Copy(place) if place.local == current_local => panic!("lock guard cannot be copied"),
-                Operand::Move(place) if place.local == current_local => place.local,
+                Operand::Move(place) if place.local == current_local => assign_data.0.local,
                 _ => current_local,
             }
         },

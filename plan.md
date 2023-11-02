@@ -24,8 +24,18 @@ For now only scan for deadlocks which occur entirely in 1 function
 
 # TODO
 
+Multiple passes better
+rwlock
+
+make external crates work
+
 For diverging terminators, maybe print warning if lock is held and they are reached
 Detect loops in basic blocks
+
+## Analysis
+
+- Properly handle projections of locals
+- Analyse functions where guards are passed into
 
 ## Messages
 
@@ -33,3 +43,8 @@ Detect loops in basic blocks
     - ideally it would just be a short path relative to the crate root
 - Include a note section in the error message with the correct order to lock locks
 - Print error messages in order they occur in file, not some random order based on what hashmap iter decides
+
+# Notes
+
+rust version:
+rustc 1.75.0-nightly (475c71da0 2023-10-11)
