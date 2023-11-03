@@ -105,6 +105,7 @@ pub struct AnalysisPass<'tcx> {
     session: Rc<Session>,
     pass_target: AnalysisPassTarget,
     invocations: HashMap<Bbid, LockInvocation>,
+    return_map: FunctionReturnMap,
     lock_class_ty_map: LockClassTyMap<'tcx>,
     // this ensures errors are emitted in order
     errors: RefCell<BTreeSet<DeadlockError<'tcx>>>,
@@ -117,6 +118,7 @@ impl<'tcx> AnalysisPass<'tcx> {
             session,
             pass_target,
             invocations: HashMap::new(),
+            return_map: FunctionReturnMap::default(),
             lock_class_ty_map: LockClassTyMap::default(),
             errors: RefCell::default(),
         }
@@ -173,6 +175,24 @@ impl<'tcx> AnalysisPass<'tcx> {
                 };
 
                 self.invocations.insert(bbid, LockInvocation::new(lock_class, terminator.source_info.span));
+            } else if let Some(called_fn_def_id) = get_fn_def_id_from_terminator(&terminator) {
+                // not a lock invocation, just record return location for regular function call
+                let TerminatorKind::Call { target, destination, .. } = terminator.kind else {
+                    // panic safety: get_fn_def_id_from_terminator ensures terminator is Call
+                    panic!("expected call terminator");
+                };
+
+                if let Some(basic_block) = target {
+                    let return_location = ReturnLocation {
+                        return_bbid: Bbid {
+                            def_id,
+                            basic_block,
+                        },
+                        return_local: destination.local,
+                    };
+
+                    self.return_map.insert_return_location(called_fn_def_id, return_location);
+                }
             }
         }
     }
@@ -212,13 +232,7 @@ impl<'tcx> AnalysisPass<'tcx> {
                 panic!("lock invocation is expected to be call");
             };
 
-            let collector = DependantClassCollector {
-                tcx: self.tcx,
-                invocation_map: &self.invocations,
-                dependant_classes: HashSet::new(),
-                visited_blocks: HashSet::new(),
-                visited_functions: HashSet::new(),
-            };
+            let collector = DependantClassCollector::new(self.tcx, &self.invocations, &self.return_map);
             let child_invocations = collector.collect(bbid.with_basic_block(target), destination.local);
             *invocation.child_invocations.borrow_mut() = child_invocations;
         }
@@ -245,10 +259,8 @@ impl<'tcx> AnalysisPass<'tcx> {
     pub fn run_pass(&mut self) {
         self.collect_invocations();
         self.collect_dependant_lock_classes();
-        println!("{:#?}", self.invocations);
 
         let dependant_map = self.get_dependant_map();
-        println!("{dependant_map:#?}");
 
         for invocation in self.invocations.values() {
             for child_id in invocation.child_invocations.borrow().iter() {
@@ -317,6 +329,28 @@ impl Ord for DeadlockError<'_> {
     }
 }
 
+/// A map from a function definition id to all the basic blocks it might return to
+#[derive(Debug, Default)]
+struct FunctionReturnMap(HashMap<DefId, HashSet<ReturnLocation>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReturnLocation {
+    return_bbid: Bbid,
+    return_local: Local,
+}
+
+impl FunctionReturnMap {
+    fn insert_return_location(&mut self, fn_def_id: DefId, return_location: ReturnLocation) {
+        self.0.entry(fn_def_id)
+            .or_default()
+            .insert(return_location);
+    }
+
+    fn iter_return_locations<'a>(&'a self, fn_def_id: DefId) -> impl Iterator<Item = ReturnLocation> + 'a {
+        self.0[&fn_def_id].iter().copied()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalBlockPair {
     block: Bbid,
@@ -344,21 +378,33 @@ impl GuardState {
 struct DependantClassCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     invocation_map: &'a HashMap<Bbid, LockInvocation>,
+    return_map: &'a FunctionReturnMap,
     dependant_classes: HashSet<Bbid>,
     visited_blocks: HashSet<LocalBlockPair>,
     // Functions which are visited without looking for a particular lock guard being dropped
     visited_functions: HashSet<DefId>,
 }
 
-impl DependantClassCollector<'_, '_> {
+impl<'a, 'tcx> DependantClassCollector<'a, 'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, invocation_map: &'a HashMap<Bbid, LockInvocation>, return_map: &'a FunctionReturnMap) -> Self {
+        DependantClassCollector {
+            tcx,
+            invocation_map,
+            return_map,
+            dependant_classes: HashSet::new(),
+            visited_blocks: HashSet::new(),
+            visited_functions: HashSet::new(),
+        }
+    }
+
     fn collect(mut self, basic_block_id: Bbid, lock_local: Local) -> HashSet<Bbid> {
-        self.collect_inner(basic_block_id, lock_local);
+        self.collect_inner(basic_block_id, lock_local, true);
 
         let Self { dependant_classes, .. } = self;
         dependant_classes
     }
 
-    fn collect_inner(&mut self, basic_block_id: Bbid, mut current_local: Local) -> GuardState {
+    fn collect_inner(&mut self, basic_block_id: Bbid, mut current_local: Local, examine_returns: bool) -> GuardState {
         let mut basic_block = basic_block_id.basic_block;
         let mut guard_state = GuardState::Undetermined;
         let Some(mir_body) = self.tcx.try_optimized_mir(basic_block_id.def_id) else {
@@ -395,7 +441,13 @@ impl DependantClassCollector<'_, '_> {
                 TerminatorKind::SwitchInt { targets, .. } => {
                     for (_, target) in targets.iter() {
                         // this runs for each branch except the otherwise
-                        guard_state = guard_state.combine(self.collect_inner(basic_block_id.with_basic_block(target), current_local));
+                        guard_state = guard_state.combine(
+                            self.collect_inner(
+                                basic_block_id.with_basic_block(target),
+                                current_local,
+                                examine_returns,
+                            )
+                        );
                     }
 
                     // now we run for the otherwise branch
@@ -403,14 +455,33 @@ impl DependantClassCollector<'_, '_> {
                 },
                 TerminatorKind::UnwindResume => return guard_state.combine(GuardState::Undetermined),
                 TerminatorKind::UnwindTerminate(_) => return guard_state.combine(GuardState::Undetermined),
+                TerminatorKind::Return if examine_returns => {
+                    if current_local == Local::from_u32(0) {
+                        // if we are eximining return locations, treat this similar to a switch int with branches all being return locations
+                        for return_location in self.return_map.iter_return_locations(basic_block_id.def_id) {
+                            guard_state = guard_state.combine(
+                                self.collect_inner(
+                                    return_location.return_bbid,
+                                    return_location.return_local,
+                                    true,
+                                )
+                            );
+                        }
+
+                        return guard_state;
+                    } else {
+                        panic!("function returned while guard not dropped");
+                    }
+                },
                 TerminatorKind::Return => {
+                    // analysis is done if we don't want to examine returns
                     // if current local is the return place
                     if current_local == Local::from_u32(0) {
                         return guard_state.combine(GuardState::Returned);
                     } else {
                         panic!("function returned while guard not dropped");
                     }
-                }
+                },
                 TerminatorKind::Unreachable => return guard_state.combine(GuardState::Undetermined),
                 TerminatorKind::Drop { place, target, .. } => {
                     if place.local == current_local {
@@ -453,7 +524,7 @@ impl DependantClassCollector<'_, '_> {
                         // FIXME: this might not be correct
                         (Some(_arg), None) => return guard_state.combine(GuardState::Dropped),
                         (Some(arg), Some(fn_def_id)) => {
-                            match self.collect_inner(Bbid::fn_start(fn_def_id), arg) {
+                            match self.collect_inner(Bbid::fn_start(fn_def_id), arg, false) {
                                 // guard will now be in function return local
                                 GuardState::Returned => current_local = destination.local,
                                 // guard dropped finish analysis
