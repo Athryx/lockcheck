@@ -1,4 +1,4 @@
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashSet, HashMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -6,9 +6,10 @@ use std::rc::Rc;
 use rustc_session::Session;
 use rustc_span::{Span, symbol::Symbol, def_id::DefId};
 use rustc_middle::ty::{TyCtxt, TyKind, Ty};
-use rustc_middle::mir::{BasicBlock, Terminator, TerminatorKind, Operand, Const, ConstValue, Body, Local, Statement, StatementKind, Rvalue};
+use rustc_middle::mir::{BasicBlock, Terminator, TerminatorKind, Operand, Const, ConstValue, Body, Local, Statement, StatementKind, Rvalue, START_BLOCK};
 use rustc_middle::mir::traversal::reachable;
 use rustc_hir::ItemKind;
+use rustc_error_messages::MultiSpan;
 
 use super::LOCK_FILLER_FN_NAME;
 use crate::diagnostic::deadlock_error;
@@ -81,12 +82,32 @@ struct Bbid {
     basic_block: BasicBlock,
 }
 
+impl Bbid {
+    /// Returns the bbid of the basic block at the start of a given function
+    fn fn_start(def_id: DefId) -> Self {
+        Bbid {
+            def_id,
+            basic_block: START_BLOCK,
+        }
+    }
+
+    /// Creates a new basic block id in the same function as the current one with a differnt basic block
+    fn with_basic_block(&self, basic_block: BasicBlock) -> Self {
+        Bbid {
+            def_id: self.def_id,
+            basic_block,
+        }
+    }
+}
+
 pub struct AnalysisPass<'tcx> {
     tcx: TyCtxt<'tcx>,
     session: Rc<Session>,
     pass_target: AnalysisPassTarget,
     invocations: HashMap<Bbid, LockInvocation>,
     lock_class_ty_map: LockClassTyMap<'tcx>,
+    // this ensures errors are emitted in order
+    errors: RefCell<BTreeSet<DeadlockError<'tcx>>>,
 }
 
 impl<'tcx> AnalysisPass<'tcx> {
@@ -97,27 +118,16 @@ impl<'tcx> AnalysisPass<'tcx> {
             pass_target,
             invocations: HashMap::new(),
             lock_class_ty_map: LockClassTyMap::default(),
+            errors: RefCell::default(),
         }
     }
 
     fn is_terminator_lock_invocation(&self, terminator: &Terminator) -> bool {
-        let TerminatorKind::Call { func, .. } = &terminator.kind else {
-            return false;
-        };
-
-        let Operand::Constant(c) = func else {
-            return false;
-        };
-
-        let Const::Val(ConstValue::ZeroSized, fn_type) = c.const_ else {
-            return false;
-        };
-
-        let TyKind::FnDef(def_id, _) = fn_type.kind() else {
-            return false;
-        };
-
-        *def_id == self.pass_target.lock_method
+        if let Some(def_id) = get_fn_def_id_from_terminator(terminator) {
+            def_id == self.pass_target.lock_method
+        } else {
+            false
+        }
     }
 
     fn lock_class_from_terminator(&mut self, mir_body: &Body<'tcx>, basic_block: BasicBlock) -> Option<LockClass> {
@@ -203,13 +213,12 @@ impl<'tcx> AnalysisPass<'tcx> {
             };
 
             let collector = DependantClassCollector {
+                tcx: self.tcx,
                 invocation_map: &self.invocations,
-                mir_body_def_id: bbid.def_id,
-                mir_body,
                 dependant_classes: HashSet::new(),
                 visited_blocks: HashSet::new(),
             };
-            let child_invocations = collector.collect(target, destination.local);
+            let child_invocations = collector.collect(bbid.with_basic_block(target), destination.local);
             *invocation.child_invocations.borrow_mut() = child_invocations;
         }
     }
@@ -251,59 +260,125 @@ impl<'tcx> AnalysisPass<'tcx> {
                 }
             }
         }
+
+        self.emit_all_errors();
     }
 
     fn emit_deadlock_error(&self, parent_invocation: &LockInvocation, child_invocation: &LockInvocation) {
         let parent_ty = self.lock_class_ty_map.get_ty(parent_invocation.class);
         let child_ty = self.lock_class_ty_map.get_ty(child_invocation.class);
-        deadlock_error(&self.session, parent_ty, parent_invocation.span, child_ty, child_invocation.span);
+
+        let error = DeadlockError {
+            parent_ty,
+            child_ty,
+            parent_span: parent_invocation.span,
+            child_span: child_invocation.span,
+        };
+
+        self.errors.borrow_mut().insert(error);
+    }
+
+    fn emit_all_errors(&self) {
+        for error in self.errors.borrow().iter() {
+            let mut multi_span = MultiSpan::from_span(error.child_span);
+            multi_span.push_span_label(error.parent_span, format!("lock class `{}` first locked here", error.parent_ty));
+            multi_span.push_span_label(error.child_span, format!("deadlock occurs when lock class `{}` locked here", error.child_ty));
+        
+            self.session.struct_span_err(multi_span, "potential deadlock detected").emit();
+        }
+    }
+}
+
+struct DeadlockError<'tcx> {
+    parent_ty: Ty<'tcx>,
+    child_ty: Ty<'tcx>,
+    parent_span: Span,
+    child_span: Span,
+}
+
+impl PartialEq for DeadlockError<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.child_span == other.child_span
+    }
+}
+
+impl Eq for DeadlockError<'_> {}
+
+impl PartialOrd for DeadlockError<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DeadlockError<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.child_span.cmp(&other.child_span)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct LocalBlockPair {
-    block: BasicBlock,
+    block: Bbid,
     local: Local,
 }
 
+/// Indicates what happed to a lock guard passed in a function
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardState {
+    Returned,
+    Dropped,
+    Undetermined,
+}
+
+impl GuardState {
+    fn combine(self, other: GuardState) -> Self {
+        match (self, other) {
+            (Self::Returned, _) | (_, Self::Returned) => Self::Returned,
+            (Self::Dropped, _) | (_, Self::Dropped) => Self::Dropped,
+            _ => Self::Undetermined,
+        }
+    }
+}
+
 struct DependantClassCollector<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
     invocation_map: &'a HashMap<Bbid, LockInvocation>,
-    mir_body_def_id: DefId,
-    mir_body: &'tcx Body<'tcx>,
     dependant_classes: HashSet<Bbid>,
     visited_blocks: HashSet<LocalBlockPair>,
 }
 
 impl DependantClassCollector<'_, '_> {
-    fn collect(mut self, basic_block: BasicBlock, lock_local: Local) -> HashSet<Bbid> {
-        self.collect_inner(basic_block, lock_local);
+    fn collect(mut self, basic_block_id: Bbid, lock_local: Local) -> HashSet<Bbid> {
+        self.collect_inner(basic_block_id, lock_local);
 
         let Self { dependant_classes, .. } = self;
         dependant_classes
     }
 
-    fn collect_inner(&mut self, mut basic_block: BasicBlock, mut current_local: Local) {
+    fn collect_inner(&mut self, basic_block_id: Bbid, mut current_local: Local) -> GuardState {
+        let mut basic_block = basic_block_id.basic_block;
+        let mut guard_state = GuardState::Undetermined;
+        let mir_body = self.tcx.optimized_mir(basic_block_id.def_id);
+
         loop {
+            let current_bbid = basic_block_id.with_basic_block(basic_block);
+
             // don't visit a block for which we already examined the flow for the given local
             let local_block_pair = LocalBlockPair {
-                block: basic_block,
+                block: current_bbid,
                 local: current_local,
             };
             if self.visited_blocks.contains(&local_block_pair) {
-                return;
+                return GuardState::Undetermined;
             }
             self.visited_blocks.insert(local_block_pair);
 
             // mark dependant class if this current block also is a lock invocation
-            let current_bbid = Bbid {
-                def_id: self.mir_body_def_id,
-                basic_block,
-            };
             if self.invocation_map.contains_key(&current_bbid) {
                 self.dependant_classes.insert(current_bbid);
             }
 
-            let basic_block_data = &self.mir_body[basic_block];
+            let basic_block_data = &mir_body[basic_block];
 
             for statement in basic_block_data.statements.iter() {
                 current_local = calculate_new_local_after_statement(statement, current_local);
@@ -314,19 +389,26 @@ impl DependantClassCollector<'_, '_> {
                 TerminatorKind::SwitchInt { targets, .. } => {
                     for (_, target) in targets.iter() {
                         // this runs for each branch except the otherwise
-                        self.collect_inner(target, current_local);
+                        guard_state = guard_state.combine(self.collect_inner(basic_block_id.with_basic_block(target), current_local));
                     }
 
                     // now we run for the otherwise branch
                     basic_block = targets.otherwise();
                 },
-                TerminatorKind::UnwindResume => return,
-                TerminatorKind::UnwindTerminate(_) => return,
-                TerminatorKind::Return => return,
-                TerminatorKind::Unreachable => panic!("found unreachable block"),
+                TerminatorKind::UnwindResume => return guard_state.combine(GuardState::Undetermined),
+                TerminatorKind::UnwindTerminate(_) => return guard_state.combine(GuardState::Undetermined),
+                TerminatorKind::Return => {
+                    // if current local is the return place
+                    if current_local == Local::from_u32(0) {
+                        return guard_state.combine(GuardState::Returned);
+                    } else {
+                        panic!("function returned while guard not dropped");
+                    }
+                }
+                TerminatorKind::Unreachable => return guard_state.combine(GuardState::Undetermined),
                 TerminatorKind::Drop { place, target, .. } => {
                     if place.local == current_local {
-                        return;
+                        return guard_state.combine(GuardState::Dropped);
                     } else {
                         basic_block = *target;
                     }
@@ -336,14 +418,19 @@ impl DependantClassCollector<'_, '_> {
                         panic!("lock guard overwritten while not dropped");
                     }
 
-                    for arg in args.iter() {
+                    // If the guard is passed into the function, this will be the local of the guard
+                    let mut guard_arg_local = None;
+                    for (i, arg) in args.iter().enumerate() {
                         // FIXME: we should examine function that is called to see if it potantially
                         // stores mutext guard somewhere or returns the mutex guard again
                         // currently we assume the function just drops it
                         
                         match arg {
                             // lock guard is moved into the function and assumed for now to be dropped in that function, finish analysis
-                            Operand::Move(place) if place.local == current_local => return,
+                            Operand::Move(place) if place.local == current_local => {
+                                guard_arg_local = Some(Local::from_u32(i as u32 + 1));
+                                break;
+                            },
                             // FIXME: I don't know if this is actually true, I think after drop elaboration
                             // the compiler may turn moves into copies
                             Operand::Copy(place) if place.local == current_local => panic!("lock guard cannot be copied"),
@@ -351,17 +438,40 @@ impl DependantClassCollector<'_, '_> {
                         }
                     }
 
+                    let fn_def_id = get_fn_def_id_from_terminator(&basic_block_data.terminator());
+                    match (guard_arg_local, fn_def_id) {
+                        // if lock guard was passed into function, but we don't know which function, just assume it was dropped
+                        // FIXME: this might not be correct
+                        (Some(_arg), None) => return guard_state.combine(GuardState::Dropped),
+                        (Some(arg), Some(fn_def_id)) => {
+                            match self.collect_inner(Bbid::fn_start(fn_def_id), arg) {
+                                // guard will now be in function return local
+                                GuardState::Returned => current_local = destination.local,
+                                // guard dropped finish analysis
+                                GuardState::Dropped => return guard_state.combine(GuardState::Dropped),
+                                // function went into infinite loop, return
+                                GuardState::Undetermined => return guard_state.combine(GuardState::Undetermined),
+                            }
+                        },
+                        (None, Some(fn_def_id)) => {
+                            // TODO
+                        },
+                        // we don't know what function was called, can't eximine if it locked anything
+                        // FIXME: this might not be correct
+                        (None, None) => (),
+                    }
+
                     if let Some(target) = target {
                         basic_block = *target;
                     } else {
                         // function call diverges
-                        return;
+                        return guard_state.combine(GuardState::Undetermined);
                     }
                 },
                 TerminatorKind::Assert { target, .. } => basic_block = *target,
                 TerminatorKind::Yield { .. } => todo!(),
                 // aparently this is like a return from generator?
-                TerminatorKind::GeneratorDrop => return,
+                TerminatorKind::GeneratorDrop => todo!(),
                 TerminatorKind::FalseEdge { real_target, .. } => basic_block = *real_target,
                 TerminatorKind::FalseUnwind { real_target, .. } => basic_block = *real_target,
                 // TODO: detect if inline asm operands is local we are using
@@ -370,12 +480,32 @@ impl DependantClassCollector<'_, '_> {
                         basic_block = *dest;
                     } else {
                         // inline asm is diverging
-                        return;
+                        return guard_state.combine(GuardState::Undetermined);
                     }
                 }
             }
         }
     }
+}
+
+fn get_fn_def_id_from_terminator(terminator: &Terminator) -> Option<DefId> {
+    let TerminatorKind::Call { func, .. } = &terminator.kind else {
+        return None;
+    };
+
+    let Operand::Constant(c) = func else {
+        return None;
+    };
+
+    let Const::Val(ConstValue::ZeroSized, fn_type) = c.const_ else {
+        return None;
+    };
+
+    let TyKind::FnDef(def_id, _) = fn_type.kind() else {
+        return None;
+    };
+
+    Some(*def_id)
 }
 
 /// Tracks where the given local will be after executing the statement

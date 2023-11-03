@@ -171,4 +171,25 @@ fn deadlock10() {
     let guard2 = mutex.lock().unwrap();
 }
 
+struct Deadlock11;
+fn deadlock11() {
+    fn inner() {
+        let mutex = Mutex::new(Deadlock11);
+
+        let guard1 = mutex.lock();
+        let guard2 = mutex.lock();
+    }
+}
+
+struct Deadlock12;
+fn deadlock12() {
+    let a = || {
+        let mutex = Mutex::new(Deadlock12);
+
+        let guard1 = mutex.lock();
+        let guard2 = mutex.lock();
+    };
+    a();
+}
+
 fn main() {}

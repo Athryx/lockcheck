@@ -29,13 +29,19 @@ rwlock
 
 make external crates work
 
+analyse closures as well
+
 For diverging terminators, maybe print warning if lock is held and they are reached
-Detect loops in basic blocks
+Detect loops in basic blocks (of course impossible to do right, probable don't do this)
 
 ## Analysis
 
 - Properly handle projections of locals
+    - This will also fix issue of handling derefs
+        - Still in general a hard problem to handle derefs
 - Analyse functions where guards are passed into
+- Analyse functions guards are returned from
+- Handle mutexes with generic parameters depending on other generics
 
 ## Messages
 
