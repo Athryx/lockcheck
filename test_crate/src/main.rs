@@ -192,4 +192,25 @@ fn deadlock12() {
     a();
 }
 
+struct Deadlock13a;
+struct Deadlock13b;
+fn deadlock13() {
+    let mutex = Mutex::new(Deadlock13a);
+    let mutex2 = Mutex::new(Deadlock13b);
+
+    let guard = mutex.lock();
+
+    fn inner() {
+        let mutex = Mutex::new(Deadlock13b);
+
+        let guard = mutex.lock();
+    }
+
+    inner();
+    drop(guard);
+
+    let guard2 = mutex2.lock();
+    let guard3 = mutex.lock();
+}
+
 fn main() {}

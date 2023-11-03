@@ -15,7 +15,7 @@ extern crate rustc_index;
 
 mod analysis;
 mod config;
-mod diagnostic;
+mod tyctxt_ext;
 
 use std::process::Command;
 

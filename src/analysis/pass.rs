@@ -12,7 +12,7 @@ use rustc_hir::ItemKind;
 use rustc_error_messages::MultiSpan;
 
 use super::LOCK_FILLER_FN_NAME;
-use crate::diagnostic::deadlock_error;
+use crate::tyctxt_ext::TyCtxtExt;
 
 #[derive(Debug)]
 pub struct AnalysisPassTarget {
@@ -217,6 +217,7 @@ impl<'tcx> AnalysisPass<'tcx> {
                 invocation_map: &self.invocations,
                 dependant_classes: HashSet::new(),
                 visited_blocks: HashSet::new(),
+                visited_functions: HashSet::new(),
             };
             let child_invocations = collector.collect(bbid.with_basic_block(target), destination.local);
             *invocation.child_invocations.borrow_mut() = child_invocations;
@@ -345,6 +346,8 @@ struct DependantClassCollector<'a, 'tcx> {
     invocation_map: &'a HashMap<Bbid, LockInvocation>,
     dependant_classes: HashSet<Bbid>,
     visited_blocks: HashSet<LocalBlockPair>,
+    // Functions which are visited without looking for a particular lock guard being dropped
+    visited_functions: HashSet<DefId>,
 }
 
 impl DependantClassCollector<'_, '_> {
@@ -358,7 +361,10 @@ impl DependantClassCollector<'_, '_> {
     fn collect_inner(&mut self, basic_block_id: Bbid, mut current_local: Local) -> GuardState {
         let mut basic_block = basic_block_id.basic_block;
         let mut guard_state = GuardState::Undetermined;
-        let mir_body = self.tcx.optimized_mir(basic_block_id.def_id);
+        let Some(mir_body) = self.tcx.try_optimized_mir(basic_block_id.def_id) else {
+            // if we cannot get mir, say it is underetmined
+            return GuardState::Undetermined;
+        };
 
         loop {
             let current_bbid = basic_block_id.with_basic_block(basic_block);
@@ -438,6 +444,9 @@ impl DependantClassCollector<'_, '_> {
                         }
                     }
 
+                    // FIXME: I think this could be a compiler intrisic
+                    // currently this function will return None, and we will assume intrinsice drops argument
+                    // but it might be better to hard code the case for compiler intrinsics and what they do
                     let fn_def_id = get_fn_def_id_from_terminator(&basic_block_data.terminator());
                     match (guard_arg_local, fn_def_id) {
                         // if lock guard was passed into function, but we don't know which function, just assume it was dropped
@@ -454,7 +463,7 @@ impl DependantClassCollector<'_, '_> {
                             }
                         },
                         (None, Some(fn_def_id)) => {
-                            // TODO
+                            self.collect_all_invocations(fn_def_id);
                         },
                         // we don't know what function was called, can't eximine if it locked anything
                         // FIXME: this might not be correct
@@ -483,6 +492,33 @@ impl DependantClassCollector<'_, '_> {
                         return guard_state.combine(GuardState::Undetermined);
                     }
                 }
+            }
+        }
+    }
+
+    // TODO: this data can probably be cached for entire program
+    fn collect_all_invocations(&mut self, fn_def_id: DefId) {
+        if !self.visited_functions.insert(fn_def_id) {
+            // we have already visited this function
+            return
+        }
+
+        let Some(mir_body) = self.tcx.try_optimized_mir(fn_def_id) else {
+            return;
+        };
+
+        for (basic_block, _) in reachable(mir_body) {
+            let bbid = Bbid {
+                def_id: fn_def_id,
+                basic_block,
+            };
+
+            if self.invocation_map.contains_key(&bbid) {
+                // this is a lock invocation, add it to dependant classes
+                self.dependant_classes.insert(bbid);
+            } else if let Some(called_fn_def_id) = get_fn_def_id_from_terminator(&mir_body.basic_blocks[basic_block].terminator()) {
+                // this is a regular function call, collect invocations in that function
+                self.collect_all_invocations(called_fn_def_id);
             }
         }
     }
