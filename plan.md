@@ -34,6 +34,11 @@ analyse closures as well
 For diverging terminators, maybe print warning if lock is held and they are reached
 Detect loops in basic blocks (of course impossible to do right, probable don't do this)
 
+## Cargo Stuff
+
+- Maybe allow passing more arguments to cargo lockcheck
+- Fix random file thing being generated
+
 ## Analysis
 
 - Properly handle projections of locals

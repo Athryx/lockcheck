@@ -11,7 +11,7 @@ use rustc_middle::mir::traversal::reachable;
 use rustc_hir::ItemKind;
 use rustc_error_messages::MultiSpan;
 
-use super::LOCK_FILLER_FN_NAME;
+use super::{LOCK_FILLER_FN_NAME, ErrorStatus};
 use crate::tyctxt_ext::TyCtxtExt;
 
 #[derive(Debug)]
@@ -256,7 +256,7 @@ impl<'tcx> AnalysisPass<'tcx> {
         dependant_map
     }
 
-    pub fn run_pass(&mut self) {
+    pub fn run_pass(&mut self) -> ErrorStatus {
         self.collect_invocations();
         self.collect_dependant_lock_classes();
 
@@ -274,7 +274,7 @@ impl<'tcx> AnalysisPass<'tcx> {
             }
         }
 
-        self.emit_all_errors();
+        self.emit_all_errors()
     }
 
     fn emit_deadlock_error(&self, parent_invocation: &LockInvocation, child_invocation: &LockInvocation) {
@@ -291,13 +291,19 @@ impl<'tcx> AnalysisPass<'tcx> {
         self.errors.borrow_mut().insert(error);
     }
 
-    fn emit_all_errors(&self) {
+    fn emit_all_errors(&self) -> ErrorStatus {
         for error in self.errors.borrow().iter() {
             let mut multi_span = MultiSpan::from_span(error.child_span);
             multi_span.push_span_label(error.parent_span, format!("lock class `{}` first locked here", error.parent_ty));
             multi_span.push_span_label(error.child_span, format!("deadlock occurs when lock class `{}` locked here", error.child_ty));
         
             self.session.struct_span_err(multi_span, "potential deadlock detected").emit();
+        }
+
+        if self.errors.borrow().len() > 0 {
+            ErrorStatus::DeadlockDetected
+        } else {
+            ErrorStatus::Ok
         }
     }
 }

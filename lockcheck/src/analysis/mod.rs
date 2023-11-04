@@ -1,20 +1,42 @@
 mod pass;
 
-use std::{path, process, str};
+use std::str;
 use std::fmt::Write;
 use std::rc::Rc;
+use std::ops::BitOr;
 
-use rustc_interface::Config;
 use rustc_session::Session;
-use rustc_session::config::{self, CheckCfg};
-use rustc_span::{FileName, RealFileName, symbol::Symbol, def_id::DefId};
-use rustc_errors::registry::Registry;
+use rustc_span::{symbol::Symbol, def_id::DefId};
 use rustc_hir::{ItemKind, Node, ExprKind, StmtKind, Ty, TyKind, Expr};
 use rustc_middle::ty::{TypeckResults, TyCtxt};
-use anyhow::{Result, Context};
+use anyhow::Result;
 
 use crate::config::Config as LockCheckConfig;
+use crate::rustc_config::get_rustc_config;
 use pass::{AnalysisPass, AnalysisPassTarget};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorStatus {
+    Ok,
+    DeadlockDetected,
+}
+
+impl ErrorStatus {
+    pub fn error_emitted(self) -> bool {
+        matches!(self, Self::DeadlockDetected)
+    }
+}
+
+impl BitOr for ErrorStatus {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Self::Ok, Self::Ok) => Self::Ok,
+            _ => Self::DeadlockDetected,
+        }
+    }
+}
 
 #[derive(Default)]
 struct AnalysisCtx<'tcx> {
@@ -105,10 +127,14 @@ impl<'tcx> AnalysisCtx<'tcx> {
         typecheck.qpath_res(ty_path, call_expr.hir_id).def_id()
     }
 
-    fn run_passes(&mut self) {
+    fn run_passes(&mut self) -> ErrorStatus {
+        let mut status = ErrorStatus::Ok;
+
         for pass in self.passes.iter_mut() {
-            pass.run_pass();
+            status = status | pass.run_pass();
         }
+
+        status
     }
 }
 
@@ -122,7 +148,7 @@ const LOCK_FILLER_FN_NAME: &'static str = "__lock_check_resolve";
 /// 
 /// This is a hack to get around the fact that I have no idea how to resolve
 /// a type name to a DefId except by the lowering process from ast to hir
-fn generate_lock_filler(config: &LockCheckConfig) -> Result<String> {
+pub fn generate_lock_filler(config: &LockCheckConfig) -> Result<String> {
     let mut body = String::new();
     for lock in config.locks.iter() {
         write!(
@@ -147,58 +173,20 @@ fn generate_lock_filler(config: &LockCheckConfig) -> Result<String> {
     }}"#, LOCK_FILLER_FN_NAME, body))
 }
 
-fn get_rustc_config(lock_check_config: &LockCheckConfig) -> Result<Config> {
-    let out = process::Command::new("rustc")
-        .arg("--print=sysroot")
-        .current_dir(".")
-        .output()
-        .with_context(|| "could not determine rust sysroot")?;
-    let sysroot = str::from_utf8(&out.stdout).expect("invalid utf-8 sysroot path").trim();
-
-    let mut file_data = std::fs::read_to_string(&lock_check_config.crate_root)?;
-    let lock_resolve_filler = generate_lock_filler(&lock_check_config)?;
-    file_data.push_str(&lock_resolve_filler);
-
-    Ok(Config {
-        opts: config::Options {
-            maybe_sysroot: Some(path::PathBuf::from(sysroot)),
-            ..config::Options::default()
-        },
-        input: config::Input::Str {
-            name: FileName::Real(RealFileName::LocalPath(lock_check_config.crate_root.clone())),
-            input: file_data,
-        },
-        crate_cfg: rustc_hash::FxHashSet::default(),
-        crate_check_cfg: CheckCfg::default(),
-        output_dir: None,
-        output_file: None,
-        file_loader: None,
-        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES,
-        lint_caps: rustc_hash::FxHashMap::default(),
-        parse_sess_created: None,
-        register_lints: None,
-        override_queries: None,
-        make_codegen_backend: None,
-        registry: Registry::new(&rustc_error_codes::DIAGNOSTICS),
-        expanded_args: Vec::new(),
-        ice_file: None,
-    })
-}
-
-pub fn run(config: &LockCheckConfig) -> Result<()> {
+pub fn run(config: &LockCheckConfig) -> Result<ErrorStatus> {
     let rustc_config = get_rustc_config(&config)?;
 
-    rustc_interface::run_compiler(rustc_config, |compiler| {
+    let status = rustc_interface::run_compiler(rustc_config, |compiler| {
         compiler.enter(|queries| {
             let _crate_ast = queries.parse().unwrap().get_mut().clone();
 
             queries.global_ctxt().unwrap().enter(|tcx| {
                 let mut analysis_ctx = AnalysisCtx::parse_passes_from_hir(tcx, compiler.session());
 
-                analysis_ctx.run_passes();
-            });
-        });
+                analysis_ctx.run_passes()
+            })
+        })
     });
 
-    Ok(())
+    Ok(status)
 }

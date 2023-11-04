@@ -15,24 +15,29 @@ extern crate rustc_index;
 
 mod analysis;
 mod config;
+mod rustc_config;
 mod tyctxt_ext;
 
-use std::process::Command;
-
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 fn run() -> Result<()> {
     let config = config::load_config()?;
 
-    let cargo_build_status = Command::new("cargo")
+    /*let cargo_build_status = Command::new("cargo")
         .arg("build")
         .status()?;
 
     if !cargo_build_status.success() {
         bail!("Cargo build failed");
+    }*/
+
+    let status = analysis::run(&config)?;
+    if status.error_emitted() {
+        // cargo panics if we emit an error but don't exit with non zero error code
+        std::process::exit(1);
     }
 
-    analysis::run(&config)
+    Ok(())
 }
 
 fn main() {

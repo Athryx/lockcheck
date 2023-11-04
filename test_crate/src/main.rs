@@ -1,4 +1,5 @@
 use std::sync::{Mutex, Arc, MutexGuard, LockResult};
+use parking_lot::Mutex as OtherMutex;
 
 struct Okay1;
 fn okay1() {
