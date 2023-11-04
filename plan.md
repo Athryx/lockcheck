@@ -39,8 +39,6 @@ Detect loops in basic blocks (of course impossible to do right, probable don't d
 - Properly handle projections of locals
     - This will also fix issue of handling derefs
         - Still in general a hard problem to handle derefs
-- Analyse functions where guards are passed into
-- Analyse functions guards are returned from
 - Handle mutexes with generic parameters depending on other generics
 
 ## Messages
@@ -48,6 +46,11 @@ Detect loops in basic blocks (of course impossible to do right, probable don't d
 - Fix error messages having long path including whole absolute path
     - ideally it would just be a short path relative to the crate root
 - Include a note section in the error message with the correct order to lock locks
+
+## Done
+
+- Analyse functions where guards are passed into
+- Analyse functions guards are returned from
 - Print error messages in order they occur in file, not some random order based on what hashmap iter decides
 
 # Notes
