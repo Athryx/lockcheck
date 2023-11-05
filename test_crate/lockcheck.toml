@@ -1,5 +1,3 @@
-crate_root = "src/main.rs"
-
 [[locks]]
 lock = "std::sync::Mutex"
 guard = "std::sync::MutexGuard"

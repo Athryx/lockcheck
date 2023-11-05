@@ -25,8 +25,11 @@ pub fn get_rustc_config(lock_check_config: &LockCheckConfig) -> Result<Config> {
     let cfg = interface::parse_cfgspecs(&early_error_handler, matches.opt_strs("cfg"));
     let check_cfg = interface::parse_check_cfg(&early_error_handler, matches.opt_strs("check-cfg"));
 
+    let Some(input_file) = matches.free.get(0) else {
+        bail!("no input filename given");
+    };
 
-    let mut file_data = std::fs::read_to_string(&lock_check_config.crate_root)?;
+    let mut file_data = std::fs::read_to_string(input_file)?;
     let lock_resolve_filler = generate_lock_filler(&lock_check_config)?;
     file_data.push_str(&lock_resolve_filler);
 
@@ -35,7 +38,7 @@ pub fn get_rustc_config(lock_check_config: &LockCheckConfig) -> Result<Config> {
         crate_cfg: cfg,
         crate_check_cfg: check_cfg,
         input: config::Input::Str {
-            name: FileName::Real(RealFileName::LocalPath(lock_check_config.crate_root.clone())),
+            name: FileName::Real(RealFileName::LocalPath(input_file.into())),
             input: file_data,
         },
         output_file: None,

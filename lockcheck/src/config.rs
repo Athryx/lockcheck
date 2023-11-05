@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use anyhow::{Result, anyhow, Context};
 use serde::Deserialize;
 
@@ -18,8 +16,6 @@ pub struct LockCheckTarget {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub locks: Vec<LockCheckTarget>,
-    /// The .rs file which is the root of the crate we want to check
-    pub crate_root: PathBuf,
 }
 
 /// Attempts to load config from the `lockcheck.toml` config file
@@ -36,13 +32,8 @@ pub fn load_config() -> Result<Config> {
             }
 
             let config_data = std::fs::read_to_string(lockcheck_config_path)?;
-            let mut config: Config = toml::from_str(&config_data)
+            let config: Config = toml::from_str(&config_data)
                 .with_context(|| "invalid format of lockecheck config file")?;
-
-            // make crate root in config relative to lockcheck.toml
-            if config.crate_root.is_relative() {
-                config.crate_root = dir.join(config.crate_root);
-            }
 
             return Ok(config);
         }

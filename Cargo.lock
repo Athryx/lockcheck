@@ -1722,7 +1722,6 @@ name = "lockcheck"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
  "serde",
  "toml 0.8.4",
 ]
