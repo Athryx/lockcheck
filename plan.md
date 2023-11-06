@@ -24,15 +24,26 @@ For now only scan for deadlocks which occur entirely in 1 function
 
 # TODO
 
-Multiple passes better
+Improve multiple passes
+
 rwlock
+condvar
+reentrant mutex
+perhaps just even a more general way to specify blocking behavior of a concurrency primitive,
+and have the cargo lockcheck parse these rules to be very flexible and work with most primitives
 
-make external crates work
-
-analyse closures as well
+make external crates work better
 
 For diverging terminators, maybe print warning if lock is held and they are reached
 Detect loops in basic blocks (of course impossible to do right, probable don't do this)
+
+## Easy Stuff (Ideally Finish Before Interview)
+
+- More testing
+- Analyse closures as well (closures' fn impl don't have a defid so currently they are skipped)
+- Improve config file
+    - allow specifying multiple lock methods
+    - allow specifying if lock method returns result or not
 
 ## Cargo Stuff
 
@@ -43,13 +54,11 @@ Detect loops in basic blocks (of course impossible to do right, probable don't d
 
 - Properly handle projections of locals
     - This will also fix issue of handling derefs
-        - Still in general a hard problem to handle derefs
+        - Still in general a hard problem to handle derefs, more work needed
 - Handle mutexes with generic parameters depending on other generics
 
 ## Messages
 
-- Fix error messages having long path including whole absolute path
-    - ideally it would just be a short path relative to the crate root
 - Include a note section in the error message with the correct order to lock locks
 
 ## Done
