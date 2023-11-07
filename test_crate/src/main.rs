@@ -1,3 +1,6 @@
+mod locks;
+mod tester;
+
 use std::sync::{Mutex, Arc, MutexGuard, LockResult};
 use parking_lot::Mutex as OtherMutex;
 
@@ -181,6 +184,7 @@ fn deadlock11() {
     }
 }
 
+// FIXME: this is not detected
 struct Deadlock12;
 fn deadlock12() {
     let a = || {
@@ -241,6 +245,44 @@ fn deadlock14() {
     let mutex = Mutex::new(Deadlock14);
     let _guard1 = inner(&mutex);
     let _guard2 = inner(&mutex);
+}
+
+struct Okay15;
+fn okay15() {
+    let mutex = Mutex::new(Okay15);
+    loop {
+        let guard = mutex.lock();
+    }
+}
+
+struct Deadlock15;
+fn deadlock15(mutex: &Mutex<Deadlock15>) {
+    let guard = mutex.lock();
+    deadlock15(mutex);
+}
+
+struct Deadlock16a;
+struct Deadlock16b;
+struct Deadlock16c;
+fn deadlock16a() {
+    let mutexa = Mutex::new(Deadlock16a);
+    let mutexb = Mutex::new(Deadlock16b);
+    let guard1 = mutexa.lock();
+    let guard2 = mutexb.lock();
+}
+
+fn deadlock16b() {
+    let mutexb = Mutex::new(Deadlock16b);
+    let mutexc = Mutex::new(Deadlock16c);
+    let guard1 = mutexb.lock();
+    let guard2 = mutexc.lock();
+}
+
+fn deadlock16c() {
+    let mutexc = Mutex::new(Deadlock16c);
+    let mutexa = Mutex::new(Deadlock16a);
+    let guard1 = mutexc.lock();
+    let guard2 = mutexa.lock();
 }
 
 fn main() {}
