@@ -6,18 +6,17 @@ To build, you must install the rustc-dev component
 
 # TODO
 
-Improve multiple passes
+- Improve multiple passes
 
-rwlock
-condvar
-reentrant mutex
-perhaps just even a more general way to specify blocking behavior of a concurrency primitive,
-and have the cargo lockcheck parse these rules to be very flexible and work with most primitives
+- rwlock
+- condvar
+- reentrant mutex
+- perhaps just even a more general way to specify blocking behavior of a concurrency primitive, and have the cargo lockcheck parse these rules to be very flexible and work with most primitives
 
-make external crates work better
+- make external crates work better
 
-For diverging terminators, maybe print warning if lock is held and they are reached
-Detect loops in basic blocks (of course impossible to do right, probable don't do this)
+- For diverging terminators, maybe print warning if lock is held and they are reached
+- Detect loops in basic blocks (of course impossible to do right, probable don't do this)
 
 ## Easy Stuff (Ideally Finish Before Interview)
 
@@ -51,5 +50,4 @@ Detect loops in basic blocks (of course impossible to do right, probable don't d
 
 # Notes
 
-rust version:
-rustc 1.75.0-nightly (475c71da0 2023-10-11)
+rust version: rustc 1.75.0-nightly (475c71da0 2023-10-11)
