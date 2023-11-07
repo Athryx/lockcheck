@@ -256,30 +256,6 @@ impl<'tcx> AnalysisPass<'tcx> {
         dependant_map
     }
 
-    /*fn find_deadlocks_in_dependant_map(
-        &self,
-        current_invocation: &LockInvocation,
-        dependant_map: &HashMap<LockClass, HashSet<LockClass>>,
-        visited_invocations: &mut HashSet<Bbid>,
-    ) {
-        for child_id in current_invocation.child_invocations.borrow().iter() {
-            if visited_invocations.contains(child_id) {
-                continue;
-            }
-            visited_invocations.insert(*child_id);
-
-            let child_invocation = &self.invocations[child_id];
-            let child_dependancies = &dependant_map[&child_invocation.class];
-
-            if child_dependancies.contains(&current_invocation.class) {
-                // deadlock detected
-                self.emit_deadlock_error(current_invocation, child_invocation);
-            }
-
-            self.find_deadlocks_in_dependant_map(child_invocation, dependant_map, visited_invocations);
-        }
-    }*/
-
     fn dependancies_contain(
         target_class: LockClass,
         current_class: LockClass,
@@ -310,25 +286,20 @@ impl<'tcx> AnalysisPass<'tcx> {
         self.collect_dependant_lock_classes();
 
         let dependant_map = self.get_dependant_map();
-        /*for invocation in self.invocations.values() {
-            let mut visited_invocations = HashSet::new();
-            self.find_deadlocks_in_dependant_map(invocation, &dependant_map, &mut visited_invocations);
-        }*/
 
         for invocation in self.invocations.values() {
             for child_id in invocation.child_invocations.borrow().iter() {
                 let child_invocation = &self.invocations[child_id];
 
                 let mut visited_classes = HashSet::new();
-                if Self::dependancies_contain(invocation.class, child_invocation.class, &dependant_map, &mut visited_classes) {
+                if Self::dependancies_contain(
+                    invocation.class,
+                    child_invocation.class,
+                    &dependant_map,
+                    &mut visited_classes,
+                ) {
                     self.emit_deadlock_error(invocation, child_invocation);
                 }
-                /*let child_dependancies = &dependant_map[&child_invocation.class];
-
-                // if somewhere else our lock class is locked after the child, it is a deadlock potential error
-                if child_dependancies.contains(&invocation.class) {
-                    self.emit_deadlock_error(invocation, child_invocation);
-                }*/
             }
         }
 
