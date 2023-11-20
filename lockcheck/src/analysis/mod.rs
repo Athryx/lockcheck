@@ -1,11 +1,10 @@
+mod errors;
 mod pass;
 
 use std::str;
 use std::fmt::Write;
-use std::rc::Rc;
 use std::ops::BitOr;
 
-use rustc_session::Session;
 use rustc_span::{symbol::Symbol, def_id::DefId};
 use rustc_hir::{ItemKind, Node, ExprKind, StmtKind, Ty, TyKind, Expr};
 use rustc_middle::ty::{TypeckResults, TyCtxt};
@@ -14,18 +13,7 @@ use anyhow::Result;
 use crate::config::Config as LockCheckConfig;
 use crate::rustc_config::get_rustc_config;
 use pass::{AnalysisPass, AnalysisPassTarget};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorStatus {
-    Ok,
-    DeadlockDetected,
-}
-
-impl ErrorStatus {
-    pub fn error_emitted(self) -> bool {
-        matches!(self, Self::DeadlockDetected)
-    }
-}
+use errors::{Errors, ErrorStatus};
 
 impl BitOr for ErrorStatus {
     type Output = Self;
@@ -44,7 +32,7 @@ struct AnalysisCtx<'tcx> {
 }
 
 impl<'tcx> AnalysisCtx<'tcx> {
-    fn parse_passes_from_hir(tcx: TyCtxt<'tcx>, session: &Rc<Session>) -> Self {
+    fn parse_passes_from_hir(tcx: TyCtxt<'tcx>) -> Self {
         let mut passes = Vec::new();
 
         let hir = tcx.hir();
@@ -96,7 +84,7 @@ impl<'tcx> AnalysisCtx<'tcx> {
                         lock_constructor: lock_constructor_def_id,
                         lock_method: lock_method_def_id,
                         guard: guard_def_id,
-                    }, tcx, session.clone());
+                    }, tcx);
                     passes.push(pass);
                 }
             }
@@ -127,14 +115,10 @@ impl<'tcx> AnalysisCtx<'tcx> {
         typecheck.qpath_res(ty_path, call_expr.hir_id).def_id()
     }
 
-    fn run_passes(&mut self) -> ErrorStatus {
-        let mut status = ErrorStatus::Ok;
-
+    fn run_passes(&mut self, errors: &mut Errors<'tcx>) {
         for pass in self.passes.iter_mut() {
-            status = status | pass.run_pass();
+            pass.run_pass(errors);
         }
-
-        status
     }
 }
 
@@ -181,9 +165,12 @@ pub fn run(config: &LockCheckConfig) -> Result<ErrorStatus> {
             let _crate_ast = queries.parse().unwrap().get_mut().clone();
 
             queries.global_ctxt().unwrap().enter(|tcx| {
-                let mut analysis_ctx = AnalysisCtx::parse_passes_from_hir(tcx, compiler.session());
+                let mut analysis_ctx = AnalysisCtx::parse_passes_from_hir(tcx,);
+                let mut errors = Errors::new(compiler.session().clone());
 
-                analysis_ctx.run_passes()
+                analysis_ctx.run_passes(&mut errors);
+
+                errors.emit_all_errors()
             })
         })
     });

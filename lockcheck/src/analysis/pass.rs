@@ -1,17 +1,15 @@
-use std::collections::{HashSet, HashMap, BTreeSet};
+use std::collections::{HashSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
-use std::rc::Rc;
 
-use rustc_session::Session;
 use rustc_span::{Span, symbol::Symbol, def_id::DefId};
 use rustc_middle::ty::{TyCtxt, TyKind, Ty};
 use rustc_middle::mir::{BasicBlock, Terminator, TerminatorKind, Operand, Const, ConstValue, Body, Local, Statement, StatementKind, Rvalue, START_BLOCK};
 use rustc_middle::mir::traversal::reachable;
 use rustc_hir::ItemKind;
-use rustc_error_messages::MultiSpan;
 
-use super::{LOCK_FILLER_FN_NAME, ErrorStatus};
+use super::errors::{InvocationErrorInfo, Errors};
+use super::LOCK_FILLER_FN_NAME;
 use crate::tyctxt_ext::TyCtxtExt;
 
 #[derive(Debug)]
@@ -54,6 +52,13 @@ impl<'tcx> LockClassTyMap<'tcx> {
     fn get_ty(&self, class: LockClass) -> Ty<'tcx> {
         self.class_to_ty[&class]
     }
+
+    fn get_invocation_error_info(&self, invocation: &LockInvocation) -> InvocationErrorInfo<'tcx> {
+        InvocationErrorInfo {
+            span: invocation.span,
+            ty: self.get_ty(invocation.class),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -64,7 +69,7 @@ pub struct LockInvocation {
 }
 
 impl LockInvocation {
-    fn new(class: LockClass, span: Span,) -> Self {
+    fn new(class: LockClass, span: Span) -> Self {
         LockInvocation {
             class,
             child_invocations: RefCell::new(HashSet::new()),
@@ -102,25 +107,20 @@ impl Bbid {
 
 pub struct AnalysisPass<'tcx> {
     tcx: TyCtxt<'tcx>,
-    session: Rc<Session>,
     pass_target: AnalysisPassTarget,
     invocations: HashMap<Bbid, LockInvocation>,
     return_map: FunctionReturnMap,
     lock_class_ty_map: LockClassTyMap<'tcx>,
-    // this ensures errors are emitted in order
-    errors: RefCell<BTreeSet<DeadlockError<'tcx>>>,
 }
 
 impl<'tcx> AnalysisPass<'tcx> {
-    pub fn new(pass_target: AnalysisPassTarget, tcx: TyCtxt<'tcx>, session: Rc<Session>) -> Self {
+    pub fn new(pass_target: AnalysisPassTarget, tcx: TyCtxt<'tcx>) -> Self {
         AnalysisPass {
             tcx,
-            session,
             pass_target,
             invocations: HashMap::new(),
             return_map: FunctionReturnMap::default(),
             lock_class_ty_map: LockClassTyMap::default(),
-            errors: RefCell::default(),
         }
     }
 
@@ -281,7 +281,7 @@ impl<'tcx> AnalysisPass<'tcx> {
         return false;
     }
 
-    pub fn run_pass(&mut self) -> ErrorStatus {
+    pub fn run_pass(&mut self, errors: &mut Errors<'tcx>) {
         self.collect_invocations();
         self.collect_dependant_lock_classes();
 
@@ -298,69 +298,12 @@ impl<'tcx> AnalysisPass<'tcx> {
                     &dependant_map,
                     &mut visited_classes,
                 ) {
-                    self.emit_deadlock_error(invocation, child_invocation);
+                    let child_error = self.lock_class_ty_map.get_invocation_error_info(invocation);
+                    let parent_error = self.lock_class_ty_map.get_invocation_error_info(child_invocation);
+                    errors.emit_deadlock_error(parent_error, child_error);
                 }
             }
         }
-
-        self.emit_all_errors()
-    }
-
-    fn emit_deadlock_error(&self, parent_invocation: &LockInvocation, child_invocation: &LockInvocation) {
-        let parent_ty = self.lock_class_ty_map.get_ty(parent_invocation.class);
-        let child_ty = self.lock_class_ty_map.get_ty(child_invocation.class);
-
-        let error = DeadlockError {
-            parent_ty,
-            child_ty,
-            parent_span: parent_invocation.span,
-            child_span: child_invocation.span,
-        };
-
-        self.errors.borrow_mut().insert(error);
-    }
-
-    fn emit_all_errors(&self) -> ErrorStatus {
-        for error in self.errors.borrow().iter() {
-            let mut multi_span = MultiSpan::from_span(error.child_span);
-            multi_span.push_span_label(error.parent_span, format!("lock class `{}` first locked here", error.parent_ty));
-            multi_span.push_span_label(error.child_span, format!("deadlock occurs when lock class `{}` locked here", error.child_ty));
-        
-            self.session.struct_span_err(multi_span, "potential deadlock detected").emit();
-        }
-
-        if self.errors.borrow().len() > 0 {
-            ErrorStatus::DeadlockDetected
-        } else {
-            ErrorStatus::Ok
-        }
-    }
-}
-
-struct DeadlockError<'tcx> {
-    parent_ty: Ty<'tcx>,
-    child_ty: Ty<'tcx>,
-    parent_span: Span,
-    child_span: Span,
-}
-
-impl PartialEq for DeadlockError<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.child_span == other.child_span
-    }
-}
-
-impl Eq for DeadlockError<'_> {}
-
-impl PartialOrd for DeadlockError<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DeadlockError<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.child_span.cmp(&other.child_span)
     }
 }
 
